@@ -9,6 +9,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+#include <sys/stat.h>
+#include <errno.h>
+
 /**
  * Project 1 starter code
  * All parts needed to be changed/added are marked with TODO
@@ -44,9 +47,9 @@ struct server_app {
  * @brief Struct for easy manipulation of file metadata.
  */
 struct local_file {
-    char *type;
-    char *content;
+    const char *type;
     long int size;
+    const unsigned char *content;
 };
 
 // The following function is implemented for you and doesn't need
@@ -60,11 +63,17 @@ void proxy_remote_file(struct server_app *app, int client_socket, const char *pa
 
 
 // creates a local_file struct pointer and returns it.
-struct local_file *create_local_file(const char *type, const char *content, const long int size);
+struct local_file *create_local_file(const char *type, const unsigned char *content, const long int size);
+
 // parses a file given its name
 struct local_file *parse_file(const char *file_name);
+
+// helper function for handle_request()
+char *clean_request_url(const char *url);
+
 // helper function for parse_file()
 char *get_file_type(const char *file_name);
+char *get_read_type(const char *file_name);
 
 // The main function is provided and no change is needed
 int main(int argc, char *argv[])
@@ -189,6 +198,12 @@ void handle_request(struct server_app *app, int client_socket) {
     DEBUG_PRINT("Filename before: %s", file_name);
     DEBUG_PRINT("Start and End indices (start, end): (%d, %d)", start, end);
 
+    // clean the file
+    file_name = clean_request_url(file_name);
+
+    DEBUG_PRINT("Cleaned URL: %s", file_name);
+
+
     // if the path is "/" (root), default to index.html
     if (!strcmp(file_name, "")) {
         // we need to reallocate file_name so it's the correct size
@@ -266,29 +281,32 @@ void serve_local_file(int client_socket, const char *path) {
         response = (char *)malloc(strlen(not_found_header));
         sprintf(response, "%s", not_found_header);
 
-        DEBUG_PRINT("404 error for file: %s", path);
+        DEBUG_PRINT("Built a 404 Not Found Response for file: %s", path);
     }
     else {
-        // @todo WE NEED TO CHANGE THE 10000 IT'S JUST A PLACEHOLDER
-        response = (char *)malloc(file->size + strlen(file->type) + 10000);
+        // @todo WE NEED TO CHANGE THE 256 IT'S JUST A PLACEHOLDER
+        response = (char *)malloc(file->size + strlen(file->type) + 256);
         sprintf(response, "%s"
                 "Content-Type: %s\r\n"
                 "Content-Length: %ld\r\n"
                 "\r\n"
-                "%s\r\n", ok_header, file->type, file->size, file->content);
+                , ok_header, file->type, file->size);
 
-        DEBUG_PRINT("Response was successful for file: %s", path);
-
-        // free the file since we own it
-        free(file->type);
-        free(file->content);
-        free(file);
+        DEBUG_PRINT("Built a 200 OK Response for file: %s", path);
     }
 
 
     DEBUG_PRINT("Response is:\n%s", response);
     send(client_socket, response, strlen(response), 0);
 
+    if (file) {
+        DEBUG_PRINT("File content is:\n%s", file->content);
+        send(client_socket, file->content, file->size, 0);
+        // free the file since we own it
+        free((char *)file->type);
+        free((char *)file->content);
+        free(file);
+    }
     free(response);
 }
 
@@ -319,11 +337,11 @@ void proxy_remote_file(struct server_app *app, int client_socket, const char *re
  *
  * @note This function isn't completely necessary.
  */
-struct local_file *create_local_file(const char *type, const char *content, const long int size) {
+struct local_file *create_local_file(const char *type, const unsigned char *content, const long int size) {
     struct local_file *file = (struct local_file*)malloc(sizeof(struct local_file));
 
     file->type = (char *)type;
-    file->content = (char *)content;
+    file->content = (unsigned char *)content;
     file->size = size;
 
     return file;
@@ -342,51 +360,75 @@ struct local_file *create_local_file(const char *type, const char *content, cons
  * @todo Check to see if I am covering all potential memory leaks.
  */
 struct local_file *parse_file(const char *file_name) {
-    char *type = strdup(get_file_type(file_name));
-    char *content = NULL;
-    long int size = 0;
-    struct local_file *file = NULL;
-    
+    // gets the type of the file
+    char *file_type = strdup(get_file_type(file_name));
+    char *read_type = strdup(get_read_type(file_name));
 
-    // check for a valid type
-    if (!strcmp(type, "")) {
-        free(type);
-        perror("invalid type");
+    // debug statements (can delete)
+    DEBUG_PRINT("File type (Content-Type): %s", file_type);
+    DEBUG_PRINT("Read type (r/rb): %s", read_type);
+
+    // get the metadata of the file
+    struct stat file_stats;
+    if (stat(file_name, &file_stats) == -1) {
+        free(file_type);
+        free(read_type);
+        if (errno == ENOENT)
+            DEBUG_PRINT("File does not exist: %s", file_name);
+        else
+            perror("stat failed");
         return NULL;
     }
+    long int file_size = file_stats.st_size;
 
     // open the file (we assume it's valid here)
-    FILE *fp = fopen(file_name, "r");
+    FILE *fp = fopen(file_name, read_type);
     if (!fp) {
-        free(type);
+        free(file_type);
+        free(read_type);
         perror("fopen failed");
         return NULL;
     }
     
-    // get file size
-    fseek(fp, 0L, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0L, SEEK_SET);
-
 
     // get file content
-    content = (char *)malloc(size + 1);
+    unsigned char *content = NULL;
+    if (!strcmp(read_type, "r"))
+        content = (unsigned char *)malloc(file_size + 1);
+    else
+        content = (unsigned char *)malloc(file_size);
+
     if (!content) {
-        free(type);
+        free(file_type);
+        free(read_type);
         free(content);
         perror("malloc failed");
         fclose(fp);
         return NULL;
     }
 
+
     // read the file contents
-    fread(content, 1, size, fp);
-    content[size] = '\0';
+    size_t bytes_read = fread(content, 1, file_size, fp);
+    if (bytes_read != file_size) {
+        free(file_type);
+        free(read_type);
+        free(content);
+        perror("fread failed");
+        fclose(fp);
+        return NULL;
+    }
+
+    if (!strcmp(read_type, "r"))
+        content[file_size] = '\0';
+
+    free(read_type);
     fclose(fp);
 
-    file = create_local_file(type, content, size);
+
+    struct local_file *file = create_local_file(file_type, content, file_size);
     if (!file) {
-        free(type);
+        free(file_type);
         free(content);
         perror("malloc failed");
         return NULL;
@@ -406,22 +448,99 @@ struct local_file *parse_file(const char *file_name) {
  * @return The Content-Type OR the empty string if it's an invalid type.
  *
  * @todo We may need to add extensions.
- * @todo I guesseed and put image/jpeg. It could be wrong.
+ * @todo I guessed and put image/jpeg. It could be wrong.
  */
 char *get_file_type(const char *file_name) {
     char *extension = strrchr(file_name, '.');
-
+    
     if (extension && *(extension + 1)) {
         extension++;
-        if (strcmp(extension, "txt") == 0)
+        if (!strcmp(extension, "txt"))
             return "text/plain; charset=UTF-8";
-        else if (strcmp(extension, "html") == 0)
+        else if (!strcmp(extension, "html"))
             return "text/html; charset=UTF-8";
-        else if (strcmp(extension, "jpg") == 0)
+        else if (!strcmp(extension, "jpg"))
             return "image/jpeg";
-        else if (strcmp(extension, "m3u8") == 0)
+        else if (!strcmp(extension, "m3u8"))
             return "audio/mpegurl";
     }
-    return "";
+
+    return "application/octet-stream";
 }
 
+char *get_read_type(const char *file_name) {
+    char *extension = strrchr(file_name, '.');
+    
+    if (extension && *(extension + 1)) {
+        extension++;
+        if (!strcmp(extension, "txt") || !strcmp(extension, "html"))
+            return "r";
+    }
+
+    return "rb";
+}
+
+
+/**
+ * @brief Clean the URL
+ *
+ * This function cleans the URL by replacing all instances of "%20" with " ". 
+ *
+ * @param url: The request URL.
+ *
+ * @return The cleaned URL.
+ */
+char* clean_request_url(const char *url) {
+    // the string we'll be building into
+    char *clean_url = (char *)malloc(strlen(url) + 1);
+    // current index of clean_url
+    int index = 0;
+
+    // what we want to replace
+    char space[] = "%20";
+    // the current index of space
+    int curr = 0;
+    int space_size = strlen(space);
+
+
+    // iterate through the URL
+    for (int i = 0; i < strlen(url); i++) {
+        // we want to reset curr, write over the "%20", and add a space.
+        // e.g. "string%20" will turn into "string 20" where the "20" will be overwritten
+        //
+        // Before:
+        // string%20
+        //         ^
+        // After:
+        // string 20
+        //        ^
+        if (curr == space_size) {
+            curr = 0;
+            index -= space_size;
+            clean_url[index++] = ' ';
+        }
+
+        // since we want the substring (not subsequence), we reset it to 0 on every mismatch
+        if (url[i] == space[curr])
+            curr++;
+        else
+            curr = 0;
+
+        // build the string
+        clean_url[index++] = url[i];
+    }
+
+    // end string
+    clean_url[index] = '\0';
+
+    // trim the URL
+    unsigned long length = strlen(clean_url);
+    char *temp = (char *)malloc(length + 1);
+
+    temp[length] = '\0';
+    strcpy(temp, clean_url);
+    free(clean_url);
+    clean_url = temp;
+
+    return clean_url;
+}
